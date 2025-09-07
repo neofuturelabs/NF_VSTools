@@ -1,6 +1,6 @@
 # NF_VSTools
 
-Small, focused Visual Studio tools for C++ / Unreal Engine workflows by Neo Future Labs.
+Small Visual Studio tools extension for C++ / Unreal Engine workflows by Neo Future Labs.
 
 ## ✨ Features
 
