@@ -12,11 +12,15 @@ Duplicate a `.h`/`.hpp` + `.cpp`/`.cc`/`.cxx` pair, rename inside files, and add
 - Guards against overwriting existing files.
 - Preserves **file encoding (incl. BOM)** and **line endings** when writing.
 
-![Context menu](images/duplicate1.png)
-
-![Dialog Box](images/duplicate2.png)
-
-![Result](images/duplicate3.png)
+<p align="center">
+  <a href="images/duplicate1.png"><img src="images/duplicate1.png" width="720" alt="Context menu"></a>
+</p>
+<p align="center">
+  <a href="images/duplicate2.png"><img src="images/duplicate2.png" width="720" alt="Dialog Box"></a>
+</p>
+<p align="center">
+  <a href="images/duplicate3.png"><img src="images/duplicate3.png" width="720" alt="Result"></a>
+</p>
 
 ### Logging
 - See **Output → NF.VSTools** for diagnostics.
