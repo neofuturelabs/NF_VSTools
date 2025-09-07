@@ -1,0 +1,37 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.14.36121.58
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "NF_VSTools", "src\NF_VSTools.csproj", "{56638845-D322-4EF8-B774-69FC1D6618AC}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Debug|arm64 = Debug|arm64
+		Debug|x86 = Debug|x86
+		Release|Any CPU = Release|Any CPU
+		Release|arm64 = Release|arm64
+		Release|x86 = Release|x86
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{56638845-D322-4EF8-B774-69FC1D6618AC}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{56638845-D322-4EF8-B774-69FC1D6618AC}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{56638845-D322-4EF8-B774-69FC1D6618AC}.Debug|arm64.ActiveCfg = Debug|arm64
+		{56638845-D322-4EF8-B774-69FC1D6618AC}.Debug|arm64.Build.0 = Debug|arm64
+		{56638845-D322-4EF8-B774-69FC1D6618AC}.Debug|x86.ActiveCfg = Debug|x86
+		{56638845-D322-4EF8-B774-69FC1D6618AC}.Debug|x86.Build.0 = Debug|x86
+		{56638845-D322-4EF8-B774-69FC1D6618AC}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{56638845-D322-4EF8-B774-69FC1D6618AC}.Release|Any CPU.Build.0 = Release|Any CPU
+		{56638845-D322-4EF8-B774-69FC1D6618AC}.Release|arm64.ActiveCfg = Release|arm64
+		{56638845-D322-4EF8-B774-69FC1D6618AC}.Release|arm64.Build.0 = Release|arm64
+		{56638845-D322-4EF8-B774-69FC1D6618AC}.Release|x86.ActiveCfg = Release|x86
+		{56638845-D322-4EF8-B774-69FC1D6618AC}.Release|x86.Build.0 = Release|x86
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ExtensibilityGlobals) = postSolution
+		SolutionGuid = {4A04BF69-5C85-46BB-9AA9-D8641248B544}
+	EndGlobalSection
+EndGlobal

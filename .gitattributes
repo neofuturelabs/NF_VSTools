@@ -1,0 +1,31 @@
+* text=auto
+
+# Treat these as text, normalize EOLs
+*.cs   text
+*.csproj text
+*.sln  text eol=crlf
+*.vcxproj text
+*.filters text
+*.props text
+*.targets text
+*.xml  text
+*.xaml text
+*.vsct text
+*.h    text
+*.hpp  text
+*.c    text
+*.cc   text
+*.cpp  text
+*.cxx  text
+*.ini  text
+*.json text
+*.yml  text
+*.yaml text
+*.md   text
+
+# Binary assets (no EOL conversion)
+*.png  binary
+*.ico  binary
+*.dll  binary
+*.pdb  binary
+*.vsix binary
