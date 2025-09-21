@@ -1,15 +1,17 @@
 ﻿using Community.VisualStudio.Toolkit;
 using EnvDTE;
 using EnvDTE80;
+using Microsoft.VisualStudio.Package;
 using Microsoft.VisualStudio.Shell;
+using Microsoft.VisualStudio.VCProjectEngine;
 using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Text;  // for Encoding
 using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 using System.Windows.Forms;
-using System.Text;  // for Encoding
 
 namespace NF.VSTools
 {
@@ -25,6 +27,9 @@ namespace NF.VSTools
         private static bool IsHeader(string p) => HeaderExts.Any(e => p.EndsWith(e, StringComparison.OrdinalIgnoreCase));
         private static bool IsSource(string p) => SourceExts.Any(e => p.EndsWith(e, StringComparison.OrdinalIgnoreCase));
         private static string GetBaseName(string p) => Path.GetFileNameWithoutExtension(p) ?? "";
+
+        // Logging shortcut for this command
+        private static void LOG(string msg) => Log.Post("[DuplicatePair] " + msg);
 
         // On UI thread
         protected override void BeforeQueryStatus(EventArgs e)
@@ -50,6 +55,8 @@ namespace NF.VSTools
         {
             await ThreadHelper.JoinableTaskFactory.SwitchToMainThreadAsync();
 
+            LOG("----- START -----");
+
             var (pivotItem, pivotPath) = GetFirstSelectedProjectItem();
             if (pivotPath == null || !(IsHeader(pivotPath) || IsSource(pivotPath)))
             {
@@ -57,12 +64,17 @@ namespace NF.VSTools
                 return;
             }
 
+            LOG($"Pivot selected: {pivotPath}");
+
             // Resolve the complementary file: same dir first, then search the containing project
             if (!TryResolvePair(pivotPath, out string headerPath, out string sourcePath))
             {
+                LOG("Could not find matching header/source pair.");
                 await VS.StatusBar.ShowMessageAsync("Could not find matching header/source pair.");
                 return;
             }
+
+            LOG($"Pair resolved: header='{headerPath}' source='{sourcePath}'");
 
             string dir = Path.GetDirectoryName(headerPath)!;
             string oldBase = GetBaseName(headerPath);
@@ -73,31 +85,43 @@ namespace NF.VSTools
 
             // UI dialog: note we pass dir/exts so it can preview full paths and conflicts
             using var dlg = new ReplaceDialog(headerPath, sourcePath, dir, headerExt, sourceExt, oldBase);
+            LOG($"Dialog init: dir='{dir}' headerExt='{headerExt}' sourceExt='{sourceExt}' oldBase='{oldBase}'");
+
             if (dlg.ShowDialog() != DialogResult.OK)
+            {
+                LOG("Dialog cancelled by user.");
                 return;
+            }
 
             string find = dlg.FindText;
             string replace = dlg.ReplaceText;
             if (string.IsNullOrEmpty(find))
             {
+                LOG("Find text is empty; cancelled.");
                 await VS.StatusBar.ShowMessageAsync("Find text is empty; cancelled.");
                 return;
             }
 
             string newBase = dlg.PreviewBase;
-            string newHeader = dlg.NewHeaderPath;
-            string newSource = dlg.NewSourcePath;
+            string newHeaderPath = dlg.NewHeaderPath;
+            string newSourcePath = dlg.NewSourcePath;
+
+            LOG($"Execution plan: find='{find}' → replace='{replace}', newBase='{newBase}'");
+            LOG($"Output paths: header='{newHeaderPath}', source='{newSourcePath}'");
 
             // double-check conflicts (defense-in-depth)
-            if (File.Exists(newHeader) || File.Exists(newSource))
+            if (File.Exists(newHeaderPath) || File.Exists(newSourcePath))
             {
+                LOG("Target files already exist; aborting.");
                 await VS.StatusBar.ShowMessageAsync("Target files already exist; aborting.");
                 return;
             }
 
             // Copy
-            File.Copy(headerPath, newHeader, overwrite: false);
-            File.Copy(sourcePath, newSource, overwrite: false);
+            File.Copy(headerPath, newHeaderPath, overwrite: false);
+            File.Copy(sourcePath, newSourcePath, overwrite: false);
+            LOG($"File created: {newHeaderPath}");
+            LOG($"File created: {newSourcePath}");
 
             // ---- preserve original encoding (incl. BOM) asynchronously ----
             static async Task<(string text, Encoding enc)> ReadWithEncodingAsync(string path)
@@ -116,16 +140,17 @@ namespace NF.VSTools
             }
 
             // Rewrite NEW header (preserve encoding + dominant EOL)
-            var (hOrig, hEnc) = await ReadWithEncodingAsync(newHeader);
+            var (hOrig, hEnc) = await ReadWithEncodingAsync(newHeaderPath);
             var headerEol = DetectDominantEol(hOrig);
             var h = hOrig;
             h = h.Replace($"{oldBase}.generated.h", $"{newBase}.generated.h");
             h = Regex.Replace(h, Regex.Escape(find), replace);
             h = NormalizeEol(h, headerEol);
-            await WriteWithEncodingAsync(newHeader, h, hEnc);
+            await WriteWithEncodingAsync(newHeaderPath, h, hEnc);
+            LOG($"Header rewrite: EOL='{EolName(headerEol)}' Encoding='{hEnc?.WebName ?? "<unknown>"}' Changed={(h != hOrig)}");
 
             // Rewrite NEW source (preserve encoding + dominant EOL)
-            var (cppOrig, cEnc) = await ReadWithEncodingAsync(newSource);
+            var (cppOrig, cEnc) = await ReadWithEncodingAsync(newSourcePath);
             var sourceEol = DetectDominantEol(cppOrig);
             var cpp = cppOrig;
             // robust include update (quotes only; UE style)
@@ -136,22 +161,306 @@ namespace NF.VSTools
             );
             cpp = Regex.Replace(cpp, Regex.Escape(find), replace);
             cpp = NormalizeEol(cpp, sourceEol);
-            await WriteWithEncodingAsync(newSource, cpp, cEnc);
+            await WriteWithEncodingAsync(newSourcePath, cpp, cEnc);
+            LOG($"Source rewrite: EOL='{EolName(sourceEol)}' Encoding='{cEnc?.WebName ?? "<unknown>"}' Changed={(cpp != cppOrig)}");
 
-            // Add to Solution Explorer under the same filter/folder as the pivot
-            bool added = TryAddBesidePivot(pivotItem, newHeader, newSource);
-            if (!added)
+
+            // Add under destination filter(s) that mirror the chosen output folder(s)
+            if (!TryAddUnderDestinationFilters(pivotItem, newHeaderPath, newSourcePath))
             {
+                // very last fallback: add at project root if VCProject engine isn’t available
                 var project = await VS.Solutions.GetActiveProjectAsync();
                 if (project != null)
                 {
-                    try { await project.AddExistingFilesAsync(newHeader, newSource); }
-                    catch { /* vcxproj may fail here; at least files exist on disk */ }
+                    try
+                    {
+                        await project.AddExistingFilesAsync(newHeaderPath, newSourcePath);
+                        LOG("Added files via fallback: AddExistingFilesAsync at project root.");
+                    }
+                    catch (Exception ex)
+                    {
+                        LOG($"Failed to add files via fallback: {ex.Message}");
+                        // files still exist on disk
+                    }
                 }
             }
 
             await VS.StatusBar.ShowMessageAsync($"Duplicated {oldBase} → {newBase}");
-            Log.Post($"Done: {headerPath} + {sourcePath}  =>  {newHeader} + {newSource}");
+            LOG($"Done: {headerPath} + {sourcePath}  =>  {newHeaderPath} + {newSourcePath}");
+        }
+
+        // helper for readable EOL names
+        private static string EolName(string eol) => eol switch
+        {
+            "\r\n" => "CRLF",
+            "\n" => "LF",
+            "\r" => "CR",
+            _ => "Unknown"
+        };
+
+        // ---------- add to filters that mirror the destination folder(s) ----------
+        private static bool TryAddUnderDestinationFilters(ProjectItem? pivotItem, params string[] absolutePaths)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+
+            var dteProj = pivotItem?.ContainingProject;
+            if (dteProj == null) { LOG("AddUnderDestination: no containing project."); return false; }
+
+            // Only works for VC++ projects
+            if (dteProj.Object is not VCProject vcproj) { LOG("AddUnderDestination: not a VC++ project."); return false; }
+
+            string vcProjDir = GetProjectDir(dteProj); // may be ...\Intermediate\ProjectFiles
+            LOG($"AddUnderDestination: project='{dteProj.Name}', vcProjDir='{vcProjDir}'");
+
+            foreach (var file in absolutePaths.Where(f => !string.IsNullOrWhiteSpace(f)))
+            {
+                string? absDir = Path.GetDirectoryName(file);
+                if (string.IsNullOrWhiteSpace(absDir)) continue;
+
+                bool underProject = TryMakeRelativeDirPathMultiBase(dteProj, absDir!, out string relDir, out string baseUsed);
+                LOG($"Planning add: file='{file}', absDir='{absDir}', baseUsed='{baseUsed}', underProject={underProject}, relDir='{relDir}'");
+
+                // Build (or find) a filter hierarchy that mirrors the relative directory.
+                // If relDir == "" we add to project root (no filter).
+                VCFilter? targetFilter = EnsureFilterPath(vcproj, relDir);
+                if (targetFilter != null)
+                    LOG($"Target filter path ensured: '{FilterFullPath(targetFilter)}'");
+                else
+                    LOG("Target filter: <project root>");
+
+                // If the file is already in the project (possibly under the wrong filter), move it.
+                VCFile? existing = FindVCFile(vcproj, file);
+                if (existing != null)
+                {
+                    try { existing.Remove(); LOG($"(Shouldn't ever happen?) Existing project item removed before re-add: '{file}'"); }
+                    catch (Exception ex) { LOG($"(Really shouldn't ever happen??) Existing item remove failed (continuing): '{file}' — {ex.Message}"); }
+                }
+
+                try
+                {
+                    if (targetFilter != null) { targetFilter.AddFile(file); LOG($"Added to filter: '{file}'"); }
+                    else { vcproj.AddFile(file); LOG($"Warning: Added to project root: '{file}'"); }
+                }
+                catch (Exception ex)
+                {
+                    // If AddFile throws (rare), try project root as an emergency fallback.
+                    LOG($"Error: Add to target filter failed (will try root): '{file}' — {ex.Message}");
+                    try { vcproj.AddFile(file); LOG($"Warning: Added to project root (fallback): '{file}'"); }
+                    catch (Exception ex2) { LOG($"Error: Add to project failed: '{file}' — {ex2.Message}"); }
+                }
+            }
+
+            return true;
+        }
+
+        private static string GetProjectDir(EnvDTE.Project dteProj)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+            try
+            {
+                if (dteProj.Object is VCProject vcp)
+                    return NormalizePath(vcp.ProjectDirectory); // VC++ authoritative project dir
+            }
+            catch { /* ignore */ }
+
+            try
+            {
+                var d = Path.GetDirectoryName(dteProj.FullName) ?? "";
+                return NormalizePath(d);
+            }
+            catch { return ""; }
+        }
+
+        private static VCFilter? EnsureFilterPath(VCProject vcproj, string relDir)
+        {
+            // relDir like "Gameplay\\Enemies\\Bosses" (or "")
+            if (string.IsNullOrWhiteSpace(relDir)) return null;
+
+            // Normalize to backslashes and split
+            string[] segments = relDir
+                .Replace('/', '\\')
+                .Split(new[] { '\\' }, StringSplitOptions.RemoveEmptyEntries);
+
+            VCFilter? parent = null;
+            string built = "";
+            foreach (string seg in segments)
+            {
+                built = string.IsNullOrEmpty(built) ? seg : (built + "\\" + seg);
+                parent = parent == null
+                    ? FindOrAddTopLevelFilter(vcproj, seg)
+                    : FindOrAddChildFilter(parent, seg);
+                LOG($"Filter ensure: '{built}' (createdOrFound='{seg}')");
+            }
+            return parent;
+        }
+
+        private static VCFilter FindOrAddTopLevelFilter(VCProject vcproj, string name)
+        {
+            // Search existing top-level filters
+            foreach (VCFilter f in (IVCCollection)vcproj.Filters)
+            {
+                if (string.Equals(f.Name, name, StringComparison.OrdinalIgnoreCase))
+                    return f;
+            }
+            // Create it
+            var created = (VCFilter)vcproj.AddFilter(name);
+            LOG($"Filter created (top): '{name}'");
+            return created;
+        }
+
+        private static VCFilter FindOrAddChildFilter(VCFilter parent, string name)
+        {
+            foreach (VCFilter f in (IVCCollection)parent.Filters)
+            {
+                if (string.Equals(f.Name, name, StringComparison.OrdinalIgnoreCase))
+                    return f;
+            }
+            var created = (VCFilter)parent.AddFilter(name);
+            LOG($"Filter created (child of '{FilterFullPath(parent)}'): '{name}'");
+            return created;
+        }
+
+        // Build a readable full path for logs (best-effort)
+        private static string FilterFullPath(VCFilter f)
+        {
+            try
+            {
+                var names = new List<string>();
+                VCFilter? cur = f;
+                while (cur != null)
+                {
+                    names.Add(cur.Name);
+                    cur = cur.Parent as VCFilter;
+                }
+                names.Reverse();
+                return string.Join("\\", names);
+            }
+            catch { return f?.Name ?? "<unknown>"; }
+        }
+
+        private static VCFile? FindVCFile(VCProject vcproj, string fullPath)
+        {
+            string norm = NormalizePath(fullPath);
+            foreach (VCFile f in (IVCCollection)vcproj.Files)
+            {
+                try
+                {
+                    if (string.Equals(NormalizePath(f.FullPath), norm, StringComparison.OrdinalIgnoreCase))
+                        return f;
+                }
+                catch { /* some items may not have FullPath */ }
+            }
+            return null;
+        }
+
+        private static string NormalizePath(string p)
+        {
+            try { return Path.GetFullPath(p).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar); }
+            catch { return p; }
+        }
+
+        // Choose the best ancestor base dir (VC dir, project dir, solution dir, parents of VC dir)
+        // that actually contains targetDir. Returns relDir and which base was used (for logs).
+        private static bool TryMakeRelativeDirPathMultiBase(EnvDTE.Project dteProj, string targetDir, out string relDir, out string baseUsed)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+            relDir = ""; baseUsed = "";
+
+            var candidates = new List<string>();
+
+            // 1) VC++ project directory (often ...\Intermediate\ProjectFiles for UE)
+            try { if (dteProj.Object is VCProject vcp && !string.IsNullOrWhiteSpace(vcp.ProjectDirectory)) candidates.Add(vcp.ProjectDirectory); } catch { }
+
+            // 2) Directory of the .vcxproj
+            try { if (!string.IsNullOrWhiteSpace(dteProj.FullName)) candidates.Add(Path.GetDirectoryName(dteProj.FullName)!); } catch { }
+
+            // 3) Solution directory (usually the UE project root)
+            try { var sln = dteProj.DTE?.Solution?.FullName; if (!string.IsNullOrWhiteSpace(sln)) candidates.Add(Path.GetDirectoryName(sln)!); } catch { }
+
+            // 4) Parents of the VC project dir (hop out of Intermediate\ProjectFiles)
+            try
+            {
+                if (dteProj.Object is VCProject vcp2 && !string.IsNullOrWhiteSpace(vcp2.ProjectDirectory))
+                {
+                    string d = vcp2.ProjectDirectory;
+                    for (int i = 0; i < 3; i++)
+                    {
+                        d = Directory.GetParent(d)?.FullName ?? "";
+                        if (string.IsNullOrWhiteSpace(d)) break;
+                        candidates.Add(d);
+                    }
+                }
+            }
+            catch { }
+
+            string targFull = NormalizePath(targetDir);
+
+            string bestRel = "";
+            string bestBase = "";
+            int bestScore = int.MinValue;
+
+            foreach (var cand in candidates.Select(NormalizePath).Distinct(StringComparer.OrdinalIgnoreCase))
+            {
+                if (TryMakeRelativeDirPath(cand, targFull, out var rel))
+                {
+                    // Prefer the deepest ancestor (longest base path) that contains target
+                    int score = cand.Length;
+                    if (score > bestScore)
+                    {
+                        bestScore = score;
+                        bestBase = cand;
+                        bestRel = rel;
+                    }
+                }
+            }
+
+            bool ok = bestScore != int.MinValue;
+            baseUsed = ok ? bestBase : "";
+            relDir = ok ? bestRel : "";
+            LOG($"TryMakeRelativeDirPathMultiBase: target='{targFull}', baseUsed='{baseUsed}', ok={ok}, relDir='{relDir}'");
+            return ok;
+        }
+
+        private static bool TryMakeRelativeDirPath(string baseDir, string targetDir, out string relDir)
+        {
+            relDir = "";
+            if (string.IsNullOrWhiteSpace(baseDir) || string.IsNullOrWhiteSpace(targetDir)) return false;
+
+            try
+            {
+                // Normalize to absolute, unify separators, and ensure trailing slash for directories
+                string baseFull = AppendSlash(Path.GetFullPath(baseDir));
+                string targFull = AppendSlash(Path.GetFullPath(targetDir));
+
+                var baseUri = new Uri(baseFull, UriKind.Absolute);
+                var targUri = new Uri(targFull, UriKind.Absolute);
+
+                bool isBase = baseUri.IsBaseOf(targUri);
+                LOG($"TryMakeRelativeDirPath: baseFull='{baseFull}', targFull='{targFull}', isBase={isBase}");
+                if (!isBase) return false;
+
+                var rel = Uri.UnescapeDataString(baseUri.MakeRelativeUri(targUri).ToString());
+                relDir = rel.Replace('/', '\\').TrimEnd('\\');
+                return true;
+            }
+            catch (Exception ex)
+            {
+                LOG($"TryMakeRelativeDirPath Error: {ex.Message}");
+                return false;
+            }
+        }
+
+        private static string AppendSlash(string d)
+        {
+            if (string.IsNullOrEmpty(d)) return d;
+
+            if (d.EndsWith(Path.DirectorySeparatorChar.ToString(), StringComparison.Ordinal) ||
+                d.EndsWith(Path.AltDirectorySeparatorChar.ToString(), StringComparison.Ordinal))
+            {
+                return d;
+            }
+
+            return d + Path.DirectorySeparatorChar;
         }
 
         // Detect dominant EOL in a file: "\r\n", "\n", or "\r" (fallback to Environment.NewLine if none found)
@@ -218,8 +527,14 @@ namespace NF.VSTools
                 foreach (var ext in SourceExts)
                 {
                     var cand = Path.Combine(dir, bn + ext);
-                    if (File.Exists(cand)) { header = pivotPath; source = cand; return true; }
+                    if (File.Exists(cand))
+                    {
+                        header = pivotPath; source = cand;
+                        LOG($"Pair found in same directory: '{cand}'");
+                        return true;
+                    }
                 }
+                LOG("Pair not in same directory; scanning project for source...");
                 return TryFindComplementInProject(pivotPath, isHeader: true, out header, out source);
             }
             else if (IsSource(pivotPath))
@@ -227,8 +542,14 @@ namespace NF.VSTools
                 foreach (var ext in HeaderExts)
                 {
                     var cand = Path.Combine(dir, bn + ext);
-                    if (File.Exists(cand)) { header = cand; source = pivotPath; return true; }
+                    if (File.Exists(cand))
+                    {
+                        header = cand; source = pivotPath;
+                        LOG($"Pair found in same directory: '{cand}'");
+                        return true;
+                    }
                 }
+                LOG("Pair not in same directory; scanning project for header...");
                 return TryFindComplementInProject(pivotPath, isHeader: false, out header, out source);
             }
             return false;
@@ -247,10 +568,12 @@ namespace NF.VSTools
                 exts.Any(e => f.EndsWith(e, StringComparison.OrdinalIgnoreCase)) &&
                 string.Equals(GetBaseName(f), bn, StringComparison.OrdinalIgnoreCase);
 
+            int scanned = 0;
             foreach (EnvDTE.Project p in dte.Solution.Projects)
             {
                 foreach (var f in EnumerateProjectFiles(p))
                 {
+                    scanned++;
                     if (isHeader)
                     {
                         if (match(f, SourceExts)) { header = pivotPath; source = f; return true; }
@@ -261,6 +584,7 @@ namespace NF.VSTools
                     }
                 }
             }
+            LOG($"Project scan finished, complement not found (scanned {scanned} files).");
             return false;
         }
 
