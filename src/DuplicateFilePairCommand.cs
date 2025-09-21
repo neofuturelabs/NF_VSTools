@@ -218,7 +218,9 @@ namespace NF.VSTools
                 if (string.IsNullOrWhiteSpace(absDir)) continue;
 
                 bool underProject = TryMakeRelativeDirPathMultiBase(dteProj, absDir!, out string relDir, out string baseUsed);
-                LOG($"Planning add: file='{file}', absDir='{absDir}', baseUsed='{baseUsed}', underProject={underProject}, relDir='{relDir}'");
+                string projName = GetProjectName(dteProj); // UI thread asserted earlier in this method
+                relDir = SanitizeRelDirForProject(projName, relDir, baseUsed);
+                LOG($"Planning add: file='{file}', absDir='{absDir}', baseUsed='{baseUsed}', underProject={underProject}, relDir='{relDir}', projName='{projName}'");
 
                 // Build (or find) a filter hierarchy that mirrors the relative directory.
                 // If relDir == "" we add to project root (no filter).
@@ -251,6 +253,71 @@ namespace NF.VSTools
             }
 
             return true;
+        }        
+
+        private static string SanitizeRelDirForProject(string projectName, string relDir, string baseUsed)
+        {
+            if (string.IsNullOrWhiteSpace(relDir)) return relDir;
+
+            var segs = relDir.Replace('/', '\\')
+                             .Split(new[] { '\\' }, StringSplitOptions.RemoveEmptyEntries);
+            if (segs.Length == 0) return relDir;
+
+            // If relDir came from the solution root, it often starts with "<ProjectName>\(Source|Plugins)\..."
+            // Inside a VC++ project, filters should be relative to the project root, so drop that first segment.
+            if (segs.Length >= 2 &&
+                !string.IsNullOrEmpty(projectName) &&
+                segs[0].Equals(projectName, StringComparison.OrdinalIgnoreCase) &&
+                (segs[1].Equals("Source", StringComparison.OrdinalIgnoreCase) ||
+                 segs[1].Equals("Plugins", StringComparison.OrdinalIgnoreCase)))
+            {
+                var stripped = string.Join("\\", segs.Skip(1));
+                LOG($"relDir sanitized: stripped project head '{projectName}\\' -> '{stripped}' (baseUsed='{baseUsed}')");
+                relDir = stripped;
+            }
+
+            // Collapse accidental repeated head like "Plugins\\Foo\\Plugins\\Foo\\..."
+            string dedup = CollapseRepeatedHeadSegments(relDir);
+            if (!string.Equals(dedup, relDir, StringComparison.OrdinalIgnoreCase))
+                LOG($"relDir normalized (dedup head): '{relDir}' -> '{dedup}'");
+
+            return dedup;
+        }
+
+        private static string CollapseRepeatedHeadSegments(string relDir)
+        {
+            if (string.IsNullOrWhiteSpace(relDir)) return relDir;
+
+            var segs = relDir.Replace('/', '\\')
+                             .Split(new[] { '\\' }, StringSplitOptions.RemoveEmptyEntries);
+            if (segs.Length < 2) return relDir;
+
+            int maxK = Math.Min(5, segs.Length / 2);
+            for (int k = 1; k <= maxK; k++)
+            {
+                bool same = true;
+                for (int i = 0; i < k; i++)
+                {
+                    if (!segs[i].Equals(segs[i + k], StringComparison.OrdinalIgnoreCase))
+                    {
+                        same = false; break;
+                    }
+                }
+                if (same)
+                {
+                    var dedup = new List<string>(segs.Take(k));
+                    dedup.AddRange(segs.Skip(2 * k));
+                    return string.Join("\\", dedup);
+                }
+            }
+            return relDir;
+        }
+
+        private static string GetProjectName(EnvDTE.Project dteProj)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+            try { return dteProj?.Name ?? string.Empty; }
+            catch { return string.Empty; }
         }
 
         private static string GetProjectDir(EnvDTE.Project dteProj)
@@ -273,27 +340,69 @@ namespace NF.VSTools
 
         private static VCFilter? EnsureFilterPath(VCProject vcproj, string relDir)
         {
-            // relDir like "Gameplay\\Enemies\\Bosses" (or "")
             if (string.IsNullOrWhiteSpace(relDir)) return null;
 
-            // Normalize to backslashes and split
             string[] segments = relDir
                 .Replace('/', '\\')
                 .Split(new[] { '\\' }, StringSplitOptions.RemoveEmptyEntries);
 
             VCFilter? parent = null;
-            string built = "";
-            foreach (string seg in segments)
+            int i = 0;
+
+            while (i < segments.Length)
             {
-                built = string.IsNullOrEmpty(built) ? seg : (built + "\\" + seg);
+                // 1) Try to match an existing composite filter at this level (e.g., "Plugins\<Proj>")
+                if (TryMatchCompositeFilterAtLevel(vcproj, parent, segments, i, out VCFilter? composite, out int consumed))
+                {
+                    LOG($"Filter ensure (composite match): '{string.Join("\\", segments.Take(i + consumed))}' via '{composite!.Name}' (consumed {consumed} segs)");
+                    parent = composite;
+                    i += consumed;
+                    continue;
+                }
+
+                // 2) No composite match → proceed with single-segment ensure
+                string seg = segments[i];
                 parent = parent == null
                     ? FindOrAddTopLevelFilter(vcproj, seg)
                     : FindOrAddChildFilter(parent, seg);
-                LOG($"Filter ensure: '{built}' (createdOrFound='{seg}')");
+
+                LOG($"Filter ensure: '{string.Join("\\", segments.Take(i + 1))}' (createdOrFound='{seg}')");
+                i++;
             }
+
             return parent;
         }
 
+        // Try to find a filter at the current level whose Name equals a prefix of the remaining path segments joined by '\'
+        // e.g., remaining "Plugins","MyPlugin","Source","Module" might match a single filter named "Plugins\\MyPlugin"
+        private static bool TryMatchCompositeFilterAtLevel(VCProject vcproj, VCFilter? parent, string[] segs, int startIndex, out VCFilter? match, out int consumed)
+        {
+            match = null; consumed = 0;
+
+            // Search scope: top-level vs child filters
+            IEnumerable<VCFilter> scope = parent == null
+                ? ((IVCCollection)vcproj.Filters).Cast<VCFilter>()
+                : ((IVCCollection)parent.Filters).Cast<VCFilter>();
+
+            // Limit how deep we try (2..6 segments is plenty and avoids silly joins)
+            int maxJoin = Math.Min(6, segs.Length - startIndex);
+
+            // Try the **longest** possible prefix first
+            for (int k = maxJoin; k >= 2; k--)
+            {
+                string candidateName = string.Join("\\", segs.Skip(startIndex).Take(k));
+                foreach (var f in scope)
+                {
+                    if (f?.Name != null && f.Name.Equals(candidateName, StringComparison.OrdinalIgnoreCase))
+                    {
+                        match = f;
+                        consumed = k;
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
         private static VCFilter FindOrAddTopLevelFilter(VCProject vcproj, string name)
         {
             // Search existing top-level filters
