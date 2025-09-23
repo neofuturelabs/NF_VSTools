@@ -42,8 +42,9 @@ Successfully duplicated/renamed file pair:
 ## Build from source
 - Open `NF_VSTools.sln`, set the VSIX project as Startup, enable NuGet if not enabled, Build Solution, press **F5** or **Ctrl+F5** to launche the Experimental VS instance with or without debugging.
 
-## Roadmap / Known limits
-- Pair detection works best when header/source share the same base name. Cross-folder layouts (e.g., `Private/.../Foo.cpp` ↔ `Public/.../Foo.h`) are being improved.
+## Roadmap
+- Add radio button for when you want to write the .h / .cpp files into separate Public / Private branches instead of into the same folder.
+- Release just the file duplication functionality as a free standalone Visual Studio marketplace extension.
 
 ## License
 This project is licensed under the **MIT License**. See [`LICENSE`](./LICENSE).
