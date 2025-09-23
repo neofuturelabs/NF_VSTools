@@ -76,8 +76,9 @@ namespace NF.VSTools
 
             LOG($"Pair resolved: header='{headerPath}' source='{sourcePath}'");
 
-            string dir = Path.GetDirectoryName(headerPath)!;
-            string oldBase = GetBaseName(headerPath);
+            // Use the pivot’s physical folder so context-click decides the destination
+            string dir = Path.GetDirectoryName(pivotPath)!;
+            string oldBase = GetBaseName(pivotPath);
 
             // Respect original extensions
             var headerExt = Path.GetExtension(headerPath);
@@ -639,11 +640,17 @@ namespace NF.VSTools
                     if (File.Exists(cand))
                     {
                         header = pivotPath; source = cand;
-                        LOG($"Pair found in same directory: '{cand}'");
+                        LOG($"Pair (source) found in same directory: '{cand}'");
                         return true;
                     }
                 }
-                LOG("Pair not in same directory; scanning project for source...");
+
+                // NEW: try Public<->Private mirror first
+                LOG("Pair not in same directory; trying Public/Private mirror to find source...");
+                if (TryFindComplementAcrossPublicPrivate(pivotPath, isHeader: true, out header, out source))
+                    return true;
+
+                LOG("Mirror not found; scanning project for source...");
                 return TryFindComplementInProject(pivotPath, isHeader: true, out header, out source);
             }
             else if (IsSource(pivotPath))
@@ -654,13 +661,20 @@ namespace NF.VSTools
                     if (File.Exists(cand))
                     {
                         header = cand; source = pivotPath;
-                        LOG($"Pair found in same directory: '{cand}'");
+                        LOG($"Pair (header) found in same directory: '{cand}'");
                         return true;
                     }
                 }
-                LOG("Pair not in same directory; scanning project for header...");
+
+                // NEW: try Public<->Private mirror first
+                LOG("Pair not in same directory; trying Public/Private mirror to find header...");
+                if (TryFindComplementAcrossPublicPrivate(pivotPath, isHeader: false, out header, out source))
+                    return true;
+
+                LOG("Mirror not found; scanning project for header...");
                 return TryFindComplementInProject(pivotPath, isHeader: false, out header, out source);
             }
+
             return false;
         }
 
@@ -677,30 +691,180 @@ namespace NF.VSTools
                 exts.Any(e => f.EndsWith(e, StringComparison.OrdinalIgnoreCase)) &&
                 string.Equals(GetBaseName(f), bn, StringComparison.OrdinalIgnoreCase);
 
-            int scanned = 0;
+            int scanned = 0, projects = 0;
             foreach (EnvDTE.Project p in dte.Solution.Projects)
             {
+                if (p is null) { continue; }
+
+                bool usedVC = false;
+                try { usedVC = p.Object is VCProject; } catch { usedVC = false; }
+
                 foreach (var f in EnumerateProjectFiles(p))
                 {
                     scanned++;
                     if (isHeader)
                     {
-                        if (match(f, SourceExts)) { header = pivotPath; source = f; return true; }
+                        if (match(f, SourceExts)) { header = pivotPath; source = f; LOG($"Project scan hit ({(usedVC ? "VC" : "DTE")}): '{f}'"); return true; }
                     }
                     else
                     {
-                        if (match(f, HeaderExts)) { header = f; source = pivotPath; return true; }
+                        if (match(f, HeaderExts)) { header = f; source = pivotPath; LOG($"Project scan hit ({(usedVC ? "VC" : "DTE")}): '{f}'"); return true; }
                     }
                 }
             }
-            LOG($"Project scan finished, complement not found (scanned {scanned} files).");
+            LOG($"Project scan finished: complement not found (projects={projects}, scannedFiles={scanned}).");
             return false;
         }
 
-        private static IEnumerable<string> EnumerateProjectFiles(EnvDTE.Project project)
+        // --- UE-style Public/Private helpers -----------------------------------------
+
+        // Try quick "swap-nearest" Public<->Private for the *directory* that contains the pivot file.
+        // Returns a swapped directory path if a Public/Private segment was found.
+        private static bool TrySwapPublicPrivate(string dir, out string swappedDir)
+        {
+            swappedDir = dir;
+            if (string.IsNullOrWhiteSpace(dir)) return false;
+
+            string withSep = AppendSlash(NormalizePath(dir));
+
+            // Replace the **nearest** (right-most) Public/Private directory-segment (whole segment only).
+            var rePub = new Regex(@"(?i)(?<=^|[\\/])Public(?=[\\/])", RegexOptions.RightToLeft);
+            var rePriv = new Regex(@"(?i)(?<=^|[\\/])Private(?=[\\/])", RegexOptions.RightToLeft);
+
+            string replaced;
+            if (rePub.IsMatch(withSep))
+                replaced = rePub.Replace(withSep, "Private", 1);
+            else if (rePriv.IsMatch(withSep))
+                replaced = rePriv.Replace(withSep, "Public", 1);
+            else
+                return false;
+
+            swappedDir = replaced.TrimEnd('\\', '/');
+            return !string.Equals(swappedDir, dir, StringComparison.OrdinalIgnoreCase);
+        }
+
+        // Build a counterpart path by mirroring Public<->Private **at the module root** (Source\<Module>\).
+        // This allows Public\API\Foo.h <-> Private\API\Foo.cpp, etc.
+        private static bool TryBuildCounterpartFromModuleRoot(string pivotPath, bool wantHeader, out string counterpartPath)
+        {
+            counterpartPath = "";
+            try
+            {
+                string norm = NormalizePath(pivotPath);
+                string sep = Path.DirectorySeparatorChar.ToString();
+
+                // Find "\Source\"
+                string sourceTag = sep + "Source" + sep;
+                int iSource = norm.IndexOf(sourceTag, StringComparison.OrdinalIgnoreCase);
+                if (iSource < 0) return false;
+
+                int iModuleStart = iSource + sourceTag.Length;
+                int iAfterModule = norm.IndexOf(sep, iModuleStart);
+                if (iAfterModule < 0) return false;
+
+                string moduleRoot = norm.Substring(0, iAfterModule); // ...\Source\<Module>
+
+                int iSideStart = iAfterModule + 1;
+                int iSideEnd = norm.IndexOf(sep, iSideStart);
+                if (iSideEnd < 0) return false;
+
+                string side = norm.Substring(iSideStart, iSideEnd - iSideStart);
+                if (!side.Equals("Public", StringComparison.OrdinalIgnoreCase) &&
+                    !side.Equals("Private", StringComparison.OrdinalIgnoreCase))
+                    return false;
+
+                string otherSide = side.Equals("Public", StringComparison.OrdinalIgnoreCase) ? "Private" : "Public";
+
+                // Rel path after side (directories + filename)
+                string relAfterSide = norm.Substring(iSideEnd + 1);
+
+                string? relDir = Path.GetDirectoryName(relAfterSide);
+                if (relDir == null) relDir = "";
+
+                string bn = GetBaseName(pivotPath);
+                var exts = wantHeader ? HeaderExts : SourceExts;
+
+                foreach (var ext in exts)
+                {
+                    string cand = string.IsNullOrEmpty(relDir)
+                        ? Path.Combine(moduleRoot, otherSide, bn + ext)
+                        : Path.Combine(moduleRoot, otherSide, relDir, bn + ext);
+
+                    if (File.Exists(cand)) { counterpartPath = cand; return true; }
+                }
+                return false;
+            }
+            catch { return false; }
+        }
+
+        // Try the two fast UE patterns: nearest-segment swap, then module-root mirror.
+        private static bool TryFindComplementAcrossPublicPrivate(string pivotPath, bool isHeader, out string header, out string source)
+        {
+            header = source = "";
+
+            string bn = GetBaseName(pivotPath);
+            string pivotDir = Path.GetDirectoryName(pivotPath)!;
+
+            // (A) Quick nearest swap: ...\Public\Sub\Dir -> ...\Private\Sub\Dir (and vice versa)
+            if (TrySwapPublicPrivate(pivotDir, out string swappedDir))
+            {
+                if (isHeader)
+                {
+                    foreach (var ext in SourceExts)
+                    {
+                        string cand = Path.Combine(swappedDir, bn + ext);
+                        if (File.Exists(cand)) { header = pivotPath; source = cand; LOG($"Pair via nearest Public/Private swap: '{cand}'"); return true; }
+                    }
+                }
+                else
+                {
+                    foreach (var ext in HeaderExts)
+                    {
+                        string cand = Path.Combine(swappedDir, bn + ext);
+                        if (File.Exists(cand)) { header = cand; source = pivotPath; LOG($"Pair via nearest Public/Private swap: '{cand}'"); return true; }
+                    }
+                }
+            }
+
+            // (B) Module-root mirror: ...\Source\<Module>\Public\REL\Foo.* <-> ...\Source\<Module>\Private\REL\Foo.*
+            if (TryBuildCounterpartFromModuleRoot(pivotPath, wantHeader: !isHeader, out string mirrored))
+            {
+                if (isHeader) { header = pivotPath; source = mirrored; }
+                else { header = mirrored; source = pivotPath; }
+                LOG($"Pair via module-root Public/Private mirror: '{mirrored}'");
+                return true;
+            }
+
+            return false;
+        }
+
+        private static IEnumerable<string> EnumerateProjectFiles(EnvDTE.Project? project)
         {
             ThreadHelper.ThrowIfNotOnUIThread();
-            IEnumerable<ProjectItem> Walk(ProjectItems items)
+
+            if (project is null)
+                yield break;
+
+            // Probe VCProject safely without yielding inside a try/catch
+            VCProject? vcp = null;
+            try { vcp = project.Object as VCProject; }
+            catch { vcp = null; }
+
+            // Fast path: VC++ project
+            if (vcp != null)
+            {
+                foreach (VCFile f in (IVCCollection)vcp.Files)
+                {
+                    string pth = "";
+                    try { pth = f.FullPath; } catch { /* some items can be odd */ }
+                    if (!string.IsNullOrEmpty(pth) && File.Exists(pth))
+                        yield return pth;
+                }
+                yield break;
+            }
+
+            // Fallback: DTE walk
+            static IEnumerable<ProjectItem> Walk(ProjectItems? items)
             {
                 if (items == null) yield break;
                 foreach (ProjectItem it in items)
